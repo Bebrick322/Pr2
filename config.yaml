@@ -1,0 +1,6 @@
+package_name: A
+repository_url: https://pypi.org/simple/
+test_repository_path: ./test_graph.txt
+test_mode: true
+max_depth: 3
+filter_substring: ''

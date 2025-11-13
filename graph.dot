@@ -1,7 +1,0 @@
-digraph dependencies {
-    "A" -> "B";
-    "A" -> "C";
-    "B" -> "D";
-    "C" -> "E";
-    "C" -> "F";
-}

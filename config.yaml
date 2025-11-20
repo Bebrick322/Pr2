@@ -1,6 +1,6 @@
-package_name: A
-repository_url: https://pypi.org/simple/
-test_repository_path: ./test_graph.txt
-test_mode: true
-max_depth: 3
+package_name: 'A'
+repository_url: 'https://pypi.org/simple/'  
+test_repository_path: './test_repo'
+test_mode: True
+max_depth: 4
 filter_substring: ''

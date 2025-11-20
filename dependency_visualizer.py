@@ -1,457 +1,351 @@
-
-#!/usr/bin/env python3
 import sys
-import os
 import re
 import yaml
-import urllib.request
-import urllib.parse
-import tarfile
-import zipfile
-import tempfile
 import subprocess
+import os
+import shutil
 from pathlib import Path
-from collections import deque, defaultdict
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Dict, List, Set, Tuple
 
+try:
+    subprocess.run(['dot', '-V'], check=True, capture_output=True)
+    GRAPHVIZ_AVAILABLE = True
+except (subprocess.CalledProcessError, FileNotFoundError):
+    GRAPHVIZ_AVAILABLE = False
 
 class DependencyVisualizer:
-    def __init__(self):
-        self.config: Dict[str, any] = {
-            'package_name': None,
-            'repository_url': 'https://pypi.org/simple/',
-            'test_repository_path': './test_repo',
-            'test_mode': False,
-            'max_depth': 3,
-            'filter_substring': ''
-        }
-        self.graph: Dict[str, List[str]] = {}
-        self.load_order: List[str] = []
-        self.visited_packages: Set[str] = set()
+    def __init__(self, config_file: str):
+        self.config: Dict = {}
+        self.graph: Dict[str, Set[str]] = {}
+        self.reverse_graph: Dict[str, Set[str]] = {}
+        self.all_packages: Set[str] = set()
         self.cycles: List[List[str]] = []
-
-    def load_config(self, path: str) -> bool:
+        self._load_config(config_file)
+        self.max_depth = int(self.config.get('max_depth', 3))
+        self.filter_substring = str(self.config.get('filter_substring', '')).lower()
+        
+    def _load_config(self, config_file: str):
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                loaded = yaml.safe_load(f) or {}
-            self.config.update(loaded)
-            return self._validate_config()
+            with open(config_file, 'r', encoding='utf-8') as f:
+                self.config = yaml.safe_load(f)
         except FileNotFoundError:
-            print(f"Error: configuration file '{path}' not found.")
-            return False
+            raise ValueError(f"Ошибка: Файл конфигурации '{config_file}' не найден.")
         except yaml.YAMLError as e:
-            print(f"YAML error in '{path}': {e}")
-            return False
-        except Exception as e:
-            print(f"Unknown error loading config: {e}")
-            return False
+            raise ValueError(f"Ошибка парсинга YAML в файле '{config_file}': {e}")
+            
+        required_keys = ['package_name', 'repository_url', 'test_mode']
+        for key in required_keys:
+            if key not in self.config:
+                raise ValueError(f"Ошибка: В конфигурации отсутствует обязательный ключ '{key}'.")
 
-    def _validate_config(self) -> bool:
-        errors = []
+        if str(self.config['test_mode']).lower() == 'true' and 'test_repository_path' not in self.config:
+            raise ValueError("Ошибка: В тестовом режиме требуется 'test_repository_path'.")
 
-        pkg = self.config.get('package_name')
-        if not pkg or not isinstance(pkg, str) or not pkg.strip():
-            errors.append("'package_name' is required and must be a non-empty string.")
-
-        depth = self.config.get('max_depth')
-        if not isinstance(depth, int) or depth < 0:
-            errors.append("'max_depth' must be a non-negative integer.")
-
-        if not isinstance(self.config.get('test_mode', False), bool):
-            errors.append("'test_mode' must be boolean (true/false).")
-
-        url = self.config.get('repository_url')
-        if not isinstance(url, str) or not url.strip():
-            errors.append("'repository_url' must be a non-empty string.")
-        else:
-            try:
-                parsed = urllib.parse.urlparse(url)
-                if not parsed.scheme or not parsed.netloc:
-                    errors.append(f"Invalid URL: '{url}'")
-            except Exception:
-                errors.append(f"Invalid URL: '{url}'")
-
-        test_path = self.config.get('test_repository_path', '')
-        if self.config['test_mode']:
-            p = Path(test_path)
-            if not p.exists():
-                errors.append(f"test_repository_path '{test_path}' does not exist.")
-            elif not p.is_dir():
-                errors.append(f"test_repository_path '{test_path}' is not a directory.")
-
-        if errors:
-            print("Configuration errors:")
-            for e in errors:
-                print(e)
-            return False
-        return True
-
+        print("Проверка конфигурации пройдена.")
+        
     def run_stage1(self):
-        print("=" * 60)
-        print("STAGE 1: MINIMAL PROTOTYPE WITH CONFIGURATION")
-        print("Loaded configuration:")
-        for k, v in self.config.items():
-            print(f"  {k}: {v!r}")
-        print("Configuration validation passed.")
+        print("ЭТАП 1: МИНИМАЛЬНЫЙ ПРОТОТИП С КОНФИГУРАЦИЕЙ")
+        print("Загруженная конфигурация:")
+        for key, value in self.config.items():
+            print(f"  {key}: '{value}'")
+        print("Проверка конфигурации пройдена.")
+
+    def _get_direct_dependencies_pypi(self, package_name: str) -> List[str]:
+        print(f"Предупреждение: для пакета '{package_name}' архивы не найдены (Требуется реализация сетевого парсинга).")
+        return []
+
+    def _get_direct_dependencies_test(self, package_name: str) -> List[str]:
+        repo_path = Path(self.config['test_repository_path'])
+        
+        target_path = repo_path / package_name / 'setup.py' 
+
+        if not target_path.exists():
+            return []
+
+        content = target_path.read_text(encoding='utf-8')
+        deps = []
+        
+        matches = re.findall(r'install_requires\s*=\s*\[(.*?)\]', content, re.DOTALL | re.IGNORECASE)
+        
+        for block in matches:
+            pkg_names = re.findall(r'[\'"]([A-Za-z0-9_.-]+)[\'"](?:\s*(?:>=|<=|==|!=|>|<).*?)?(?=[,\]\n]|$)', block)
+            deps.extend([name for name in pkg_names if name.strip()])
+
+        return sorted(list(set(deps)))
 
     def get_direct_dependencies(self, package_name: str) -> List[str]:
-        if self.config['test_mode']:
+        self.all_packages.add(package_name)
+        if str(self.config['test_mode']).lower() == 'true':
             return self._get_direct_dependencies_test(package_name)
         else:
             return self._get_direct_dependencies_pypi(package_name)
 
-    def _get_direct_dependencies_test(self, package_name: str) -> List[str]:
-        repo_path = Path(self.config['test_repository_path'])
-        deps = []
-        for setup_file in repo_path.rglob('setup.py'):
-            try:
-                content = setup_file.read_text(encoding='utf-8')
-                matches = re.findall(r'install_requires\s*=\s*\[(.*?)\]', content, re.DOTALL | re.IGNORECASE)
-                for block in matches:
-                    pkg_names = re.findall(r'[\'"]?([A-Za-z0-9_][A-Za-z0-9_.-]*)[\'"]?(?:\s*(?:>=|<=|==|!=|>|<).*?)?(?=[,\]\n]|$)', block)
-                    deps.extend([name.strip() for name in pkg_names if name.strip()])
-            except Exception as e:
-                print(f"Warning: error reading {setup_file}: {e}")
-        return sorted(set(deps))
-
-    def _get_direct_dependencies_pypi(self, package_name: str) -> List[str]:
-        try:
-            base_url = self.config['repository_url'].rstrip('/')
-            package_url = f"{base_url}/{package_name.lower()}/"
-            with urllib.request.urlopen(package_url, timeout=10) as response:
-                html = response.read().decode('utf-8')
-
-            pattern = r'href=["\']([^"\']*?{}[^"\']*?\.(?:tar\.gz|zip|whl))["\']'.format(re.escape(package_name.lower()))
-            archive_links = re.findall(pattern, html, re.IGNORECASE)
-            if not archive_links:
-                print(f"Warning: no archives found for '{package_name}'")
-                return []
-
-            archive_url = urllib.parse.urljoin(package_url, archive_links[0])
-
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                archive_path = Path(tmp_dir) / "package_archive"
-                urllib.request.urlretrieve(archive_url, archive_path)
-
-                extracted_dir = Path(tmp_dir) / "extracted"
-                extracted_dir.mkdir()
-                if archive_path.suffix == '.whl':
-                    with zipfile.ZipFile(archive_path, 'r') as zf:
-                        zf.extractall(extracted_dir)
-                elif archive_path.suffix == '.zip':
-                    with zipfile.ZipFile(archive_path, 'r') as zf:
-                        zf.extractall(extracted_dir)
-                else:
-                    with tarfile.open(archive_path, 'r:gz') as tf:
-                        tf.extractall(extracted_dir)
-
-                deps = []
-                for setup_py in extracted_dir.rglob('setup.py'):
-                    try:
-                        content = setup_py.read_text(encoding='utf-8', errors='ignore')
-                        matches = re.findall(r'install_requires\s*=\s*\[(.*?)\]', content, re.DOTALL | re.IGNORECASE)
-                        for block in matches:
-                            pkg_names = re.findall(r'[\'"]?([A-Za-z0-9_][A-Za-z0-9_.-]*)[\'"]?(?:\s*(?:>=|<=|==|!=|>|<).*?)?(?=[,\]\n]|$)', block)
-                            deps.extend([name.strip() for name in pkg_names if name.strip()])
-                    except Exception as e:
-                        print(f"Warning: error parsing setup.py: {e}")
-
-                if not deps:
-                    for pyproject in extracted_dir.rglob('pyproject.toml'):
-                        try:
-                            content = pyproject.read_text(encoding='utf-8', errors='ignore')
-                            match = re.search(r'\[project\].*?dependencies\s*=\s*\[(.*?)\]', content, re.DOTALL | re.IGNORECASE)
-                            if match:
-                                block = match.group(1)
-                                pkg_names = re.findall(r'[\'"]([^\'"]+)[\'"]', block)
-                                clean_names = []
-                                for name in pkg_names:
-                                    clean = re.split(r'[>=<~!]', name)[0].strip()
-                                    if clean:
-                                        clean_names.append(clean)
-                                deps.extend(clean_names)
-                        except Exception as e:
-                            print(f"Warning: error parsing pyproject.toml: {e}")
-
-                return sorted(set(deps))
-
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                print(f"Warning: package '{package_name}' not found on PyPI.")
-            else:
-                print(f"HTTP error for '{package_name}': {e}")
-            return []
-        except Exception as e:
-            print(f"Error getting dependencies for '{package_name}': {e}")
-            return []
-
     def run_stage2(self):
-        print("=" * 60)
-        print("STAGE 2: DATA COLLECTION (direct dependencies)")
-        deps = self.get_direct_dependencies(self.config['package_name'])
-        print(f"Direct dependencies of package '{self.config['package_name']}':")
+        print("ЭТАП 2: СБОР ДАННЫХ (прямые зависимости)")
+        package_name = self.config['package_name']
+        deps = self.get_direct_dependencies(package_name)
+        
         if deps:
+            print(f"Прямые зависимости пакета '{package_name}':")
             for i, dep in enumerate(deps, 1):
                 print(f"  {i}. {dep}")
         else:
-            print("  (no direct dependencies)")
+            print(f"Прямые зависимости пакета '{package_name}':\n  (нет прямых зависимостей)")
+
         return deps
 
-    def build_dependency_graph(self) -> Dict[str, List[str]]:
-        graph = {}
-        visited = set()
-        visiting = set()
-        self.cycles.clear()
+    def _is_filtered(self, package_name: str) -> bool:
+        return self.filter_substring and self.filter_substring in package_name.lower()
 
-        def bfs_recursive(pkg: str, depth: int):
-            if depth > self.config['max_depth']:
-                return
-            if pkg in visited:
-                return
-            if pkg in visiting:
-                cycle = list(visiting) + [pkg]
-                self.cycles.append(cycle)
-                print(f"Cycle detected: {' -> '.join(cycle)}")
-                return
-
-            deps = self.get_direct_dependencies(pkg)
-            filtered_deps = [d for d in deps if self.config['filter_substring'] not in d]
-            graph[pkg] = filtered_deps
-
-            visiting.add(pkg)
-            for dep in filtered_deps:
-                bfs_recursive(dep, depth + 1)
-            visiting.remove(pkg)
-
-            visited.add(pkg)
-
-        bfs_recursive(self.config['package_name'], 0)
-        self.graph = graph
-        return graph
-
-    def run_stage3(self):
-        print("=" * 60)
-        print("STAGE 3: DEPENDENCY GRAPH CONSTRUCTION")
-        print(f"Analyzing package: {self.config['package_name']}")
-        print(f"Max depth: {self.config['max_depth']}")
-        if self.config['filter_substring']:
-            print(f"Filter substring: '{self.config['filter_substring']}'")
-        if self.config['test_mode']:
-            print("TEST MODE (local repository)")
-
-        self.build_dependency_graph()
-
-        print("\nConstructed graph:")
-        if not self.graph:
-            print("  (empty graph)")
-        for pkg, deps in sorted(self.graph.items()):
-            dep_str = ", ".join(deps) if deps else "(none)"
-            print(f"  {pkg} -> [{dep_str}]")
-
-        if self.cycles:
-            print(f"\nCycles detected: {len(self.cycles)}")
-            for i, cycle in enumerate(self.cycles, 1):
-                print(f"  Cycle {i}: {' -> '.join(cycle)}")
-        else:
-            print("\nNo cyclic dependencies detected.")
-
-    def topological_sort(self) -> List[str]:
-        in_degree = defaultdict(int)
-        all_nodes = set(self.graph.keys())
-        for deps in self.graph.values():
-            all_nodes.update(deps)
-
-        for node in all_nodes:
-            in_degree[node] = 0
-
-        for pkg, deps in self.graph.items():
-            for dep in deps:
-                in_degree[dep] += 1
-
-        queue = deque([node for node in all_nodes if in_degree[node] == 0])
-        order = []
+    def build_dependency_graph(self):
+        package_name = self.config['package_name']
+        self.all_packages.add(package_name)
+        
+        queue: List[Tuple[str, int]] = [(package_name, 0)]
+        visited: Set[str] = {package_name}
 
         while queue:
-            node = queue.popleft()
-            order.append(node)
-            for neighbor in self.graph.get(node, []):
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
+            current_pkg, current_depth = queue.pop(0)
 
-        remaining = [node for node in all_nodes if in_degree[node] > 0]
-        if remaining:
-            print(f"Warning: cyclic nodes excluded from order: {', '.join(remaining)}")
+            if current_depth >= self.max_depth and current_pkg != package_name:
+                continue
 
-        return order
-
-    def run_stage4(self):
-        print("=" * 60)
-        print("STAGE 4: LOAD ORDER (topological sorting)")
-        self.load_order = self.topological_sort()
-
-        print("Recommended installation order:")
-        if self.load_order:
-            for i, pkg in enumerate(self.load_order, 1):
-                print(f"  {i:2}. {pkg}")
-        else:
-            print("  (no acyclic nodes)")
-
-        try:
-            import subprocess
-            result = subprocess.run(
-                [sys.executable, "-m", "pipdeptree", "--packages", self.config['package_name'], "-f"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                lines = [line.strip() for line in result.stdout.splitlines() if line.strip() and not line.startswith('Warning')]
-                print("\nComparison with pipdeptree (names only):")
-                our_order = set(self.load_order)
-                pip_order = []
-                for line in lines:
-                    match = re.match(r'^\s*([A-Za-z0-9_\-]+)', line)
-                    if match:
-                        name = match.group(1)
-                        pip_order.append(name)
-                pip_order = [p for p in pip_order if p in our_order]
-
-                print(f"  Our order (acyclic part): {', '.join(self.load_order)}")
-                print(f"  pipdeptree (depth order): {', '.join(pip_order)}")
-
-                print("\nExplanation of differences:")
-                print("- pipdeptree uses DFS and outputs dependencies in traversal order (by depth),")
-                print("  while topological sorting provides a linear order ensuring dependencies")
-                print("  are installed BEFORE dependent packages.")
-                print("- pipdeptree includes cyclic dependencies (with warning), we exclude them.")
+            if current_pkg == package_name and current_depth == 0:
+                deps = self.get_direct_dependencies(current_pkg)
             else:
-                print("\npipdeptree not available (not installed or error).")
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
-            print("\npipdeptree not available (not installed or error).")
+                deps = self.get_direct_dependencies(current_pkg)
 
-    def generate_dot(self) -> str:
-        lines = ["digraph dependencies {", '  rankdir=TB;', '  node [shape=box, style=filled, fillcolor="#E0F0FF"];']
+            self.graph[current_pkg] = set()
+            
+            for dep in deps:
+                if self._is_filtered(dep):
+                    continue
+                
+                self.graph[current_pkg].add(dep)
+                self.all_packages.add(dep)
+                
+                if dep not in visited and current_depth + 1 < self.max_depth:
+                    visited.add(dep)
+                    queue.append((dep, current_depth + 1))
+        
+        self._build_reverse_graph()
+        
+    def _build_reverse_graph(self):
+        self.reverse_graph = {pkg: set() for pkg in self.all_packages}
         for pkg, deps in self.graph.items():
             for dep in deps:
-                color = 'red' if any(pkg in cycle and dep in cycle for cycle in self.cycles) else 'black'
-                style = 'bold' if color == 'red' else 'solid'
-                lines.append(f'  "{pkg}" -> "{dep}" [color="{color}", style="{style}"];')
-        lines.append("}")
-        return "\n".join(lines)
+                if dep in self.reverse_graph:
+                    self.reverse_graph[dep].add(pkg)
 
-    def render_and_show(self, dot_content: str):
+    def _find_cycles_dfs(self, node: str, visiting: Set[str], path: List[str]):
+        visiting.add(node)
+        path.append(node)
+
+        for neighbor in sorted(list(self.graph.get(node, set()))):
+            if neighbor in path:
+                cycle_start_index = path.index(neighbor)
+                self.cycles.append(path[cycle_start_index:] + [neighbor])
+            
+            if neighbor in visiting:
+                continue
+                
+            self._find_cycles_dfs(neighbor, visiting, path)
+
+        path.pop()
+        visiting.remove(node)
+
+
+    def run_stage3(self):
+        print("ЭТАП 3: ПОСТРОЕНИЕ ГРАФА ЗАВИСИМОСТЕЙ")
+        print(f"Анализируемый пакет: {self.config['package_name']}")
+        print(f"Максимальная глубина: {self.max_depth}")
+        
+        if self.filter_substring:
+            print(f"Подстрока для фильтрации: '{self.filter_substring}'")
+            
+        if str(self.config['test_mode']).lower() == 'true':
+            print("ТЕСТОВЫЙ РЕЖИМ (локальный репозиторий)")
+
+        self.build_dependency_graph()
+        self.cycles = []
+        
+        for pkg in sorted(list(self.all_packages)):
+            self._find_cycles_dfs(pkg, set(), [])
+
+        print("\nПостроенный граф:")
+        for pkg, deps in self.graph.items():
+            deps_list = sorted(list(deps)) if deps else ['(нет)']
+            print(f"  {pkg} -> {deps_list}")
+
+        if self.cycles:
+            print(f"\nОбнаружено циклов: {len(self.cycles)}")
+            for i, cycle in enumerate(self.cycles, 1):
+                print(f"  Цикл {i}: {' -> '.join(cycle)}")
+        else:
+            print("\nЦиклические зависимости не обнаружены.")
+
+    def topological_sort(self) -> List[str]:
+        in_degree: Dict[str, int] = {pkg: 0 for pkg in self.all_packages}
+        
+        for pkg in self.all_packages:
+            for dep in self.graph.get(pkg, set()):
+                in_degree[dep] = in_degree.get(dep, 0) + 1
+        
+        queue = [pkg for pkg in sorted(self.all_packages) if in_degree[pkg] == 0]
+        sorted_list = []
+        
+        while queue:
+            u = queue.pop(0)
+            sorted_list.append(u)
+            
+            for v in sorted(list(self.graph.get(u, set()))):
+                in_degree[v] -= 1
+                if in_degree[v] == 0:
+                    queue.append(v)
+                    
+        cyclical_nodes = [pkg for pkg, degree in in_degree.items() if degree > 0]
+        
+        if cyclical_nodes:
+            print(f"Предупреждение: циклические узлы исключены из порядка: {', '.join(sorted(cyclical_nodes))}")
+
+        # Возвращаем ациклическую часть в обратном порядке (зависимости ДО пакетов)
+        return [pkg for pkg in sorted_list if pkg not in cyclical_nodes][::-1]
+
+    def _get_pipdeptree_output(self, *args):
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.dot', delete=False) as f_dot:
-                f_dot.write(dot_content)
-                dot_path = f_dot.name
-
-            png_path = Path(dot_path).with_suffix('.png')
-
-            result = subprocess.run(['dot', '-Tpng', dot_path, '-o', str(png_path)], 
-                                  capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError(f"dot failed: {result.stderr}")
-
-            if sys.platform == "darwin":
-                subprocess.run(['open', str(png_path)])
-            elif sys.platform == "win32":
-                os.startfile(str(png_path))
-            else:
-                subprocess.run(['xdg-open', str(png_path)])
-
-            print(f"Graph saved and opened: {png_path}")
-            return png_path
-
-        except FileNotFoundError:
-            print("Graphviz (command 'dot') not installed. Install: sudo apt install graphviz")
+            result = subprocess.run(['pipdeptree'] + list(args), capture_output=True, text=True, check=True)
+            return result.stdout
+        except (FileNotFoundError, subprocess.CalledProcessError):
             return None
-        except Exception as e:
-            print(f"Error during rendering: {e}")
-            return None
-        finally:
-            try:
-                Path(dot_path).unlink(missing_ok=True)
-            except:
-                pass
+
+    def run_stage4(self):
+        print("ЭТАП 4: ПОРЯДОК ЗАГРУЗКИ (топологическая сортировка)")
+        
+        order = self.topological_sort()
+        print("Рекомендуемый порядок установки:")
+        for i, pkg in enumerate(order, 1):
+            print(f"  {i}. {pkg}")
+
+        if str(self.config['test_mode']).lower() == 'true':
+            pip_output = None
+        else:
+            pip_output = self._get_pipdeptree_output('-p', self.config['package_name'])
+
+        if pip_output is not None:
+            pip_order = re.findall(r'([A-Za-z0-9_.-]+)', pip_output)
+            print("\nСравнение с pipdeptree (только имена):")
+            print(f"  Наш порядок (ациклическая часть): {', '.join(order)}")
+            print(f"  pipdeptree (порядок глубины): {', '.join(pip_order)}")
+            print("\nОбъяснение расхождений:")
+            print("- pipdeptree использует DFS и выводит зависимости в порядке обхода (по глубине),\n  в то время как топологическая сортировка предоставляет линейный порядок, гарантирующий, что зависимости\n  будут установлены ДО пакетов, которые от них зависят.")
+            print("- pipdeptree включает циклические зависимости (с предупреждением), мы их исключаем.")
+        else:
+            print("\npipdeptree недоступен (не установлен или ошибка).")
+            
+    def generate_dot_code(self) -> str:
+        dot_code = [
+            "digraph dependencies {",
+            "  rankdir=TB;",
+            "  node [shape=box, style=filled, fillcolor=\"#E0F0FF\"];"
+        ]
+
+        for pkg, deps in self.graph.items():
+            for dep in deps:
+                # Проверка на то, является ли это ребро частью любого цикла
+                is_cyclic = any(pkg in cycle and dep in cycle for cycle in self.cycles)
+                color = "red" if is_cyclic else "black"
+                style = "bold" if is_cyclic else "solid"
+                
+                dot_code.append(f'  "{pkg}" -> "{dep}" [color="{color}", style="{style}"];')
+
+        dot_code.append("}")
+        return "\n".join(dot_code)
 
     def run_stage5(self):
-        print("=" * 60)
-        print("STAGE 5: VISUALIZATION")
-        dot_content = self.generate_dot()
-        print("Generated DOT code:")
-        print(dot_content)
+        print("ЭТАП 5: ВИЗУАЛИЗАЦИЯ")
+        dot_code = self.generate_dot_code()
+        
+        print("Сгенерированный DOT-код:")
+        print(dot_code)
+        
+        dot_file_name = "graph.dot"
+        with open(dot_file_name, 'w', encoding='utf-8') as f:
+            f.write(dot_code)
+        print(f"\nDOT-файл сохранен как {dot_file_name}.")
 
-        with open("graph.dot", "w", encoding="utf-8") as f:
-            f.write(dot_content)
-        print("\nDOT file saved as graph.dot.")
-
-        png_path = self.render_and_show(dot_content)
-        if png_path:
-            print(f"Image opened: {png_path}")
-
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pipdeptree", "--graph-output", "dot", "--packages", self.config['package_name']],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                print("\nComparison with pipdeptree --graph-output dot:")
-                print("- pipdeptree includes ALL dependencies (including nested), we limit by max_depth.")
-                print("- pipdeptree does not filter by substring.")
-                print("- pipdeptree does not highlight cycles in color (but issues warnings).")
+        if GRAPHVIZ_AVAILABLE:
+            try:
+                from graphviz import Source
+                src = Source(dot_code, format="png")
+                # Для работы, возможно, потребуется установить `python3 -m pip install graphviz`
+                # и сам Graphviz (программа `dot`) в систему.
+                output_path = src.render(view=True, cleanup=True)
+                print(f"Граф сохранен и открыт: {output_path}")
+            except Exception as e:
+                print(f"Ошибка при рендеринге Graphviz: {e}. Убедитесь, что Graphviz установлен и добавлен в PATH.")
+        else:
+            print("Graphviz не установлен. Невозможно сгенерировать и открыть изображение.")
+            
+        if str(self.config['test_mode']).lower() != 'true':
+            pip_graph = self._get_pipdeptree_output('--graph-output', 'dot')
+            if pip_graph is not None:
+                print("\nСравнение с pipdeptree --graph-output dot:")
+                print("- pipdeptree включает ВСЕ зависимости (включая вложенные), мы ограничиваем по max_depth.")
+                print("- pipdeptree не фильтрует по подстроке.")
+                print("- pipdeptree не подсвечивает циклы цветом (но выдает предупреждения).")
             else:
-                print("\npipdeptree --graph-output not available.")
-        except:
-            print("\npipdeptree --graph-output not available.")
-
-    def run_stage(self, stage: int):
-        try:
-            if stage >= 1:
-                self.run_stage1()
-            if stage >= 2:
-                self.run_stage2()
-            if stage >= 3:
-                self.run_stage3()
-            if stage >= 4:
-                self.run_stage4()
-            if stage >= 5:
-                self.run_stage5()
-        except KeyboardInterrupt:
-            print("\nInterrupted by user.")
-            sys.exit(1)
-        except Exception as e:
-            print(f"\nCritical error at stage {stage}: {e}")
-            sys.exit(1)
-
+                print("\npipdeptree --graph-output недоступен.")
+        
+    def run_stage(self, stage: str):
+        if stage == '--stage1':
+            self.run_stage1()
+        elif stage == '--stage2':
+            self.run_stage1()
+            print("-" * 60)
+            self.run_stage2()
+        elif stage == '--stage3':
+            self.run_stage1()
+            print("-" * 60)
+            self.run_stage3()
+        elif stage == '--stage4':
+            self.run_stage1()
+            print("-" * 60)
+            self.run_stage3()
+            print("-" * 60)
+            self.run_stage4()
+        elif stage == '--stage5':
+            self.run_stage1()
+            print("-" * 60)
+            self.run_stage3()
+            print("-" * 60)
+            self.run_stage4()
+            print("-" * 60)
+            self.run_stage5()
+        else:
+            print(f"Неизвестный этап: {stage}")
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python dependency_visualizer.py CONFIG.yaml --stageN")
-        print("  where N = 1,2,3,4,5")
-        print("\nExamples:")
-        print("  python dependency_visualizer.py config.yaml --stage1")
-        print("  python dependency_visualizer.py config_test.yaml --stage5")
+    if len(sys.argv) < 3 or not sys.argv[2].startswith('--stage'):
+        print("Использование: python dependency_visualizer.py <config_file.yaml> --stageN")
         sys.exit(1)
 
     config_file = sys.argv[1]
-    stage_arg = sys.argv[2]
+    stage_to_run = sys.argv[2]
+    
+    try:
+        # Проверка на активное виртуальное окружение
+        if not 'VIRTUAL_ENV' in os.environ and stage_to_run in ('--stage4', '--stage5'):
+            print("!!! ПРЕДУПРЕЖДЕНИЕ: Виртуальное окружение не активно. Используйте .venv для изоляции.")
+        
+        # Проверка Graphviz
+        if not GRAPHVIZ_AVAILABLE and stage_to_run == '--stage5':
+            print("!!! ОШИБКА: Graphviz (инструмент 'dot') не найден. Визуализация невозможна. Установите Graphviz.")
+            
+        app = DependencyVisualizer(config_file)
+        print("============================================================")
+        app.run_stage(stage_to_run)
+        print("\nЭтап успешно завершен.")
 
-    stage_map = {
-        "--stage1": 1,
-        "--stage2": 2,
-        "--stage3": 3,
-        "--stage4": 4,
-        "--stage5": 5
-    }
-
-    stage_number = stage_map.get(stage_arg)
-    if stage_number is None:
-        print("Invalid stage. Use: --stage1, --stage2, ..., --stage5")
+    except ValueError as e:
+        print(f"Критическая ошибка: {e}")
         sys.exit(1)
-
-    dv = DependencyVisualizer()
-    if not dv.load_config(config_file):
-        sys.exit(1)
-
-    print(f"\nStarting stage {stage_number}...")
-    dv.run_stage(stage_number)
-    print("\nStage completed successfully.")

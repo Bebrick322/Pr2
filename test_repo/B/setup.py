@@ -1,11 +1,10 @@
 from setuptools import setup
 
 setup(
-    name="test_package",
+    name="B",
     version="1.0.0",
     install_requires=[
-        "B",
-        "C",
+        "C", 
         "D"
-    ]
+        ]
 )
